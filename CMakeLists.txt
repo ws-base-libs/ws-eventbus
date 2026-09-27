@@ -20,8 +20,7 @@ if(NOT TARGET ws-error)
     include(FetchContent)
     FetchContent_Declare(ws_eventbus_dep_ws_error
         GIT_REPOSITORY https://github.com/ws-base-libs/ws-error
-        GIT_TAG        v0.1.0
-        GIT_SHALLOW    TRUE)
+        GIT_TAG        v0.2.0)
     FetchContent_MakeAvailable(ws_eventbus_dep_ws_error)
 endif()
 
@@ -54,8 +53,7 @@ if(WS_EVENTBUS_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(ws_eventbus_gtest
         GIT_REPOSITORY https://github.com/google/googletest
-        GIT_TAG        v1.14.0
-        GIT_SHALLOW    TRUE)
+        GIT_TAG        v1.14.0)
     FetchContent_MakeAvailable(ws_eventbus_gtest)
 
     foreach(suite pubsub command correlation)

@@ -28,19 +28,19 @@ namespace {
 // "which request am I serving?" and get the truth without plumbing an id through
 // every signature.
 // ---------------------------------------------------------------------------
-thread_local std::optional<CorrelationId> t_current_correlation;
+thread_local std::optional<MessageContext> t_current_context;
 
-struct CorrelationScope {
-    explicit CorrelationScope(CorrelationId const& id) {
-        previous_ = t_current_correlation;
-        t_current_correlation = id;
+struct ContextScope {
+    explicit ContextScope(MessageContext const& ctx) {
+        previous_ = t_current_context;
+        t_current_context = ctx;
     }
-    ~CorrelationScope() { t_current_correlation = previous_; }
+    ~ContextScope() { t_current_context = previous_; }
 
-    CorrelationScope(CorrelationScope const&)            = delete;
-    CorrelationScope& operator=(CorrelationScope const&) = delete;
+    ContextScope(ContextScope const&)            = delete;
+    ContextScope& operator=(ContextScope const&) = delete;
 
-    std::optional<CorrelationId> previous_;
+    std::optional<MessageContext> previous_;
 };
 
 auto id_prefix() -> std::uint64_t {
@@ -59,8 +59,31 @@ auto generate_correlation_id() -> CorrelationId {
                        counter.fetch_add(1, std::memory_order_relaxed));
 }
 
-auto current_correlation_id() -> std::optional<CorrelationId> const& {
-    return t_current_correlation;
+auto current_context() -> std::optional<MessageContext> const& { return t_current_context; }
+
+auto current_correlation_id() -> std::optional<CorrelationId> {
+    if (t_current_context) {
+        return t_current_context->correlation_id;
+    }
+    return std::nullopt;
+}
+
+auto current_source() -> std::optional<std::string> {
+    if (t_current_context && !t_current_context->source.empty()) {
+        return t_current_context->source;
+    }
+    return std::nullopt;
+}
+
+auto describe_context(MessageContext const& context) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    if (!context.correlation_id.empty()) {
+        out.push_back("request " + context.correlation_id);
+    }
+    if (!context.source.empty()) {
+        out.push_back("sent by " + context.source);
+    }
+    return out;
 }
 
 namespace detail {
@@ -75,8 +98,8 @@ namespace detail {
 // ---------------------------------------------------------------------------
 struct Sink {
     struct Item {
-        Payload      payload;
-        CorrelationId correlation;
+        Payload        payload;
+        MessageContext context;
     };
 
     explicit Sink(std::size_t capacity, OverflowPolicy policy, CmdInvoke invoke)
@@ -110,7 +133,7 @@ struct Sink {
 
     /// Enqueue, honouring the overflow policy. Returns false if the sink is
     /// closed (the item is then simply not delivered).
-    bool post(Payload payload, CorrelationId correlation) {
+    bool post(Payload payload, MessageContext context) {
         std::unique_lock lock{mutex_};
         while (!closed_ && size_ == capacity_) {
             if (policy_ == OverflowPolicy::DropOldest) {
@@ -129,7 +152,7 @@ struct Sink {
         }
 
         std::size_t const slot = (head_ + size_) % capacity_;
-        queue_[slot] = Item{std::move(payload), std::move(correlation)};
+        queue_[slot] = Item{std::move(payload), std::move(context)};
         ++size_;
         lock.unlock();
         ready_.notify_one();
@@ -138,7 +161,7 @@ struct Sink {
 
     /// Enqueue and wait for the item to be serviced. Commands use this so the
     /// caller gets its typed reply while the handler still runs on the worker.
-    auto call(Payload payload, CorrelationId correlation)
+    auto call(Payload payload, MessageContext context)
         -> std::expected<Payload, BusError> {
         auto shared = std::make_shared<std::promise<std::expected<Payload, BusError>>>();
         auto future = shared->get_future();
@@ -155,7 +178,7 @@ struct Sink {
             pending_calls_.push_back(shared);
         }
 
-        if (!post(std::move(payload), std::move(correlation))) {
+        if (!post(std::move(payload), std::move(context))) {
             shared->set_value(std::unexpected(BusError{
                 .code    = BusErrorCode::Closed,
                 .message = std::string{"the bus shut down before the command was serviced"},
@@ -186,10 +209,10 @@ private:
                 space_.notify_one();
             }
 
-            CorrelationScope scope{item.correlation};
+            ContextScope scope{item.context};
             std::expected<Payload, BusError> result{Payload{}};
             try {
-                result = invoke_(item.payload, item.correlation);
+                result = invoke_(item.payload, item.context);
             } catch (std::exception const& e) {
                 result = std::unexpected(BusError{
                     .code    = BusErrorCode::HandlerFailed,
@@ -240,7 +263,7 @@ auto make_event_sink(std::size_t capacity, OverflowPolicy policy, EventInvoke in
     return std::make_shared<Sink>(
         capacity, policy,
         [typed = std::move(typed)](Payload const& p,
-                                   CorrelationId const& c) -> std::expected<Payload, BusError> {
+                                   MessageContext const& c) -> std::expected<Payload, BusError> {
             typed(p, c);
             return std::expected<Payload, BusError>{Payload{}};
         });
@@ -250,13 +273,13 @@ auto make_command_sink(std::size_t capacity, CmdInvoke invoke) -> std::shared_pt
     return std::make_shared<Sink>(capacity, OverflowPolicy::Block, std::move(invoke));
 }
 
-void sink_post(Sink& sink, Payload payload, CorrelationId correlation) {
-    sink.post(std::move(payload), std::move(correlation));
+void sink_post(Sink& sink, Payload payload, MessageContext context) {
+    sink.post(std::move(payload), std::move(context));
 }
 
-auto sink_call(Sink& sink, Payload payload, CorrelationId correlation)
+auto sink_call(Sink& sink, Payload payload, MessageContext context)
     -> std::expected<Payload, BusError> {
-    return sink.call(std::move(payload), std::move(correlation));
+    return sink.call(std::move(payload), std::move(context));
 }
 
 void sink_close(Sink& sink) noexcept { sink.close(); }
@@ -329,7 +352,7 @@ Bus::~Bus() {
 }
 
 void Bus::post_all(std::type_index const& type, detail::Payload payload,
-                   CorrelationId const& correlation) {
+                   MessageContext const& context) {
     // Copy the target list under the lock, post outside it: a handler that
     // subscribes or unsubscribes from inside a handler must not deadlock against
     // the publisher.
@@ -341,12 +364,12 @@ void Bus::post_all(std::type_index const& type, detail::Payload payload,
         }
     }
     for (auto& sink : targets) {
-        detail::sink_post(*sink, payload, correlation);
+        detail::sink_post(*sink, payload, context);
     }
 }
 
 auto Bus::call_one(std::type_index const& type, detail::Payload payload,
-                   CorrelationId const& correlation) -> std::expected<detail::Payload, BusError> {
+                   MessageContext const& context) -> std::expected<detail::Payload, BusError> {
     std::shared_ptr<detail::Sink> target;
     {
         std::lock_guard lock{impl_->mutex};
@@ -359,9 +382,10 @@ auto Bus::call_one(std::type_index const& type, detail::Payload payload,
             .code    = BusErrorCode::NoHandler,
             .message = std::string{"no handler registered for this command type"},
             .source  = "ws::core::bus::Bus::send",
+            .context = describe_context(context),
         });
     }
-    return detail::sink_call(*target, std::move(payload), correlation);
+    return detail::sink_call(*target, std::move(payload), context);
 }
 
 void Bus::register_event(std::type_index const& type,
